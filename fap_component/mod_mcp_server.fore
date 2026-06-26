@@ -1,0 +1,1012 @@
+Const
+	DB_META = "DB_MCP_META";
+
+{
+  Классификация источников (type):
+	"olap_cube":    "Многомерный аналитический куб",
+	"tabular":      "Табличные данные (самый частый вариант)",
+	"dwh":          "Data Warehouse (табличный склад)",
+	"database":     "Реляционная база данных",
+	"api":          "Внешний API",
+	"erp":          "ERP-система",
+	"crm":          "CRM-система",
+	"file":         "Файлы (CSV, Excel и т.д.)",
+	"synthetic":    "Тестовые данные"
+}
+
+// получение списка доступных для ИИ многомерных источников
+Function MCP_GetDataSources: string;
+Var
+	List: IJsonArrayBuilder;
+	Doc: IJsonDocument;
+	Json, Item: IJsonObjectBuilder;
+	//
+	Db: IDatabaseInstance;
+	Command : IDalCommand;
+	Cursor: IDalCursor;
+	Fields: IDalCursorFields;
+	SQL: string;
+Begin
+	List := New JsonArrayBuilder.Create;
+	Try
+		Db := MetabaseClass.Active.ItemById(DB_META).Open(Null) As IDatabaseInstance;
+		SQL := "select id, name, description, s_type from mcp_sources where active = 1";
+		Command := Db.Connection.CreateCommand(SQL);
+		Command.Parse;
+		Cursor := Command.CreateCursor;
+		Fields := Cursor.Fields;
+		While Not Cursor.Eof Do
+			Item := New JsonObjectBuilder.Create;
+			Item.AddString("id", Fields.Item(0).Value);
+			Item.AddString("name", Fields.Item(1).Value);
+			Item.AddString("description", Fields.Item(2).Value);
+			Item.AddString("type", Fields.Item(3).Value);
+			List.AddObjectBuilder(Item);
+			Cursor.Next;
+		End While;
+		Cursor.Close;
+		Command.Close;
+	Except
+		Item := New JsonObjectBuilder.Create;
+		Item.AddString("error", "Не удалось получить список источников данных");
+		List.AddObjectBuilder(Item);
+	End Try;
+	// итоговый JSON	
+	Json := New JsonObjectBuilder.Create;
+	Json.AddArrayBuilder("data_sources", List);
+	Doc := New JsonDocument.Create;
+	Doc.RootElement := Json.Build;
+	Return Doc.WriteToString(JsonFormatOptions.UnIndented);
+End Function MCP_GetDataSources;
+
+{
+Каждое измерение в get_dimensions() содержит поле "type". Основные типы:
+
+- "temporal" — время/даты (используй для трендов и периодов)
+- "categorical" — обычные категории
+- "geographical" — география (регионы, страны, города)
+- "hierarchical" — иерархические данные
+- "ordinal" — упорядоченные категории (низкий/средний/высокий)
+- "boolean" / "flag" — флаги (да/нет)
+- "identifier" — технические ключи и ID
+
+Это помогает правильно выбирать измерения для группировки и фильтраци
+}
+
+// получение списка доступных для ИИ измерений в указанном источнике
+Function MCP_GetDimensions(SourceID: string): string;
+Var
+	List: IJsonArrayBuilder;
+	Doc: IJsonDocument;
+	Json, Item: IJsonObjectBuilder;
+	//
+	Db: IDatabaseInstance;
+	Command : IDalCommand;
+	Params : IDalCommandParams;
+	Cursor: IDalCursor;
+	Fields: IDalCursorFields;
+	SQL: string;
+	CDim: ICalendarDimension;
+Begin
+	List := New JsonArrayBuilder.Create;
+	Try
+		Db := MetabaseClass.Active.ItemById(DB_META).Open(Null) As IDatabaseInstance;
+		SQL := "select id, name, description, dim_type from mcp_dimensions where source_id = :src_id and active = 1";
+		Command := Db.Connection.CreateCommand(SQL);
+		Command.Parse;
+		Params := Command.Params;
+		Params.Item(0).Value := SourceID;
+		Cursor := Command.CreateCursor;
+		Fields := Cursor.Fields;
+		While Not Cursor.Eof Do
+			// проверим, не календарное ли измерение
+			If Fields.Item(3).Value = "temporal" Then
+				CDim := MetabaseClass.Active.ItemById(Fields.Item(0).Value).Bind As ICalendarDimension;
+				If CDim.IncludeDays Then
+					Item := New JsonObjectBuilder.Create;
+					Item.AddString("id", "date");
+					Item.AddString("name", "Дата");
+					Item.AddString("description", Fields.Item(2).Value);
+					Item.AddString("type", "temporal");
+					List.AddObjectBuilder(Item);
+				End If;				
+				If CDim.IncludeMonths Then
+					Item := New JsonObjectBuilder.Create;
+					Item.AddString("id", "month");
+					Item.AddString("name", "Месяц");
+					Item.AddString("description", "Месяц в формате YYYY-MM");
+					Item.AddString("type", "temporal");
+					List.AddObjectBuilder(Item);
+				End If;				
+				If CDim.IncludeYears Then
+					Item := New JsonObjectBuilder.Create;
+					Item.AddString("id", "year");
+					Item.AddString("name", "Год");
+					Item.AddString("description", "Год");
+					Item.AddString("type", "temporal");
+					List.AddObjectBuilder(Item);
+				End If;				
+			Else			
+				Item := New JsonObjectBuilder.Create;
+				Item.AddString("id", Fields.Item(0).Value);
+				Item.AddString("name", Fields.Item(1).Value);
+				Item.AddString("description", Fields.Item(2).Value);
+				Item.AddString("type", Fields.Item(3).Value);
+				List.AddObjectBuilder(Item);
+			End If;
+			Cursor.Next;
+		End While;
+		Cursor.Close;
+		Command.Close;
+	Except
+		Item := New JsonObjectBuilder.Create;
+		Item.AddString("error", "Не удалось получить список измерений");
+		List.AddObjectBuilder(Item);
+	End Try;
+	// итоговый JSON	
+	Json := New JsonObjectBuilder.Create;
+	Json.AddArrayBuilder("dimensions", List);
+	Doc := New JsonDocument.Create;
+	Doc.RootElement := Json.Build;
+	Return Doc.WriteToString(JsonFormatOptions.UnIndented);
+End Function MCP_GetDimensions;
+
+{
+В get_measures() каждая мера содержит поле "data_type". Основные возможные значения:
+
+- "currency" — денежные суммы
+- "integer" — целые числа (количество)
+- "float" — числа с дробной частью
+- "percent" — проценты
+- "ratio" — коэффициенты и конверсии
+- "count" — счётчики
+
+Используй это поле, чтобы правильно интерпретировать и форматировать результат (например, добавлять знак ₽ или %).
+}
+
+{
+Поле "format":
+- "currency" — денежный формат с двумя знаками после запятой (например: 12 345.67 ₽)
+- "n0" — целое число с разделителями тысяч (1 234 567)
+- "n2" — число с двумя знаками после запятой
+- "percent" — число + знак процента (18.40%)
+}
+
+{
+Поле "unit" в get_measures() содержит единицу измерения. 
+Самые частые значения:
+- "₽", "$", "€" — валюта
+- "шт", "ед." — штуки
+- "%" — проценты
+- "тыс. ₽", "млн ₽" — крупные суммы
+- "чел.", "заказ", "раз" — счётчики
+- "руб/шт", "руб/заказ" — удельные показатели
+
+Всегда старайся добавлять unit после числа в ответе пользователю (например: "1 245 678 ₽" или "18.4%").
+}
+
+{
+Поле "aggregation" в get_measures() показывает рекомендуемый метод агрегации по умолчанию:
+
+- "sum" — суммировать (выручка, количество)
+- "avg" / "mean" — считать среднее
+- "count" — считать количество записей
+- "count_distinct" — считать уникальные значения
+- "min", "max" — минимум/максимум
+- "none" — мера уже агрегирована или является долей/коэффициентом (не суммировать!)
+
+Когда пользователь просит посчитать показатель, старайся использовать значение из поля "aggregation", если оно указано. 
+Если в query_data есть параметр operation, он имеет приоритет над aggregation по умолчанию.
+}
+
+// получение списка доступных для ИИ метрик в указанном источнике
+Function MCP_GetMetrics(SourceID: string): string;
+Var
+	List: IJsonArrayBuilder;
+	Doc: IJsonDocument;
+	Json, Item: IJsonObjectBuilder;
+	//
+	Db: IDatabaseInstance;
+	Command : IDalCommand;
+	Params : IDalCommandParams;
+	Cursor: IDalCursor;
+	Fields: IDalCursorFields;
+	SQL: string;
+Begin
+	List := New JsonArrayBuilder.Create;
+	Try
+		Db := MetabaseClass.Active.ItemById(DB_META).Open(Null) As IDatabaseInstance;
+		SQL := "select id_s, name, description, aggregation, data_type, format, unit from mcp_facts where source_id = :src_id and active = 1";
+		Command := Db.Connection.CreateCommand(SQL);
+		Command.Parse;
+		Params := Command.Params;
+		Params.Item(0).Value := SourceID;
+		Cursor := Command.CreateCursor;
+		Fields := Cursor.Fields;
+		While Not Cursor.Eof Do
+			Item := New JsonObjectBuilder.Create;
+			Item.AddString("id", "f_" + Fields.Item(0).Value);
+			Item.AddString("name", Fields.Item(1).Value);
+			Item.AddString("description", Fields.Item(2).Value);
+			Item.AddString("aggregation", Fields.Item(3).Value);
+			Item.AddString("data_type", Fields.Item(4).Value);
+			Item.AddString("format", Fields.Item(5).Value);
+			Item.AddString("unit", Fields.Item(6).Value);
+			List.AddObjectBuilder(Item);
+			Cursor.Next;
+		End While;
+		Cursor.Close;
+		Command.Close;
+	Except
+		Item := New JsonObjectBuilder.Create;
+		Item.AddString("error", "Не удалось получить список мер (фактов)");
+		List.AddObjectBuilder(Item);
+	End Try;
+	// итоговый JSON	
+	Json := New JsonObjectBuilder.Create;
+	Json.AddArrayBuilder("metrics", List);
+	Doc := New JsonDocument.Create;
+	Doc.RootElement := Json.Build;
+	Return Doc.WriteToString(JsonFormatOptions.UnIndented);
+End Function MCP_GetMetrics;
+
+// проверяет есть ли текущая координата в оригинальной отметке, если нет - выполняет Move пока отметка не появится
+Sub IteratorMoveFaster(DimSelSet: IDimSelectionSet; Iterator: IMatrixIterator; Coord: IMatrixCoord);
+Var
+	i, DimElementIdx: integer;
+	DimInst: IDimInstance;
+	NeedToMove: boolean;
+Begin
+	While Iterator.Valid Do
+		Iterator.PutCurrentPos(Coord);
+		// проверяем текущую координату - соответсвует ли отметке?
+		NeedToMove := False;
+		For i := 0 To Coord.Count-1 Do
+			// индекс элемента в измерении
+			DimElementIdx := Coord.Item(i);
+			// экземпляр измерения
+			DimInst := Iterator.Matrix.Dimensions.Item(i).Dimension;
+			If Not DimSelSet.FindById(DimInst.Ident).IsElementSelected(DimElementIdx) Then
+				NeedToMove := True;
+				Break;
+			End If;
+		End For;
+		If NeedToMove Then
+			Iterator.Move(IteratorDirection.Next);
+		Else
+			Break;
+		End If;
+	End While;
+End Sub IteratorMoveFaster;
+
+Function GetLevelIndexById(Dim: IDimInstance; LevelId: string): integer;
+Var
+	i: integer;
+Begin
+	For i := 0 To Dim.Levels.Count-1 Do
+		If Dim.Levels.Item(i).Level.Id = Levelid Then
+			Return(i);
+		End If;
+	End For;
+	Return(-1);
+End Function GetLevelIndexById;
+
+// получение данных
+Function MCP_QueryData(SourceID, Dimensions, Measures, Filters, Operation, DateLevel: string): string;
+Var
+	List: IJsonArrayBuilder;
+	Doc: IJsonDocument;
+	Json, Json2, Item: IJsonObjectBuilder;
+	//
+	CubeInst: ICubeInstance;
+	DefDes: ICubeInstanceDestination;
+	Matr: IMatrix;
+	DimSS: IDimSelectionSet;
+	DimS: IDimSelection;
+	DimInst: IDimInstance;
+	i, j, DimElementIdx, RecN, FactDimIdx, BlockType, LevelIdx: integer;
+	Exec : ICubeInstanceDestinationExecutor;
+	SelectionFact: IDimSelectionSetFactory;
+	DimsM : ICubeModelDimensions;
+	Obj : ImetabaseObject;
+	Coord: IMatrixCoord;
+	Iterator: IMatrixIterator;
+	//
+	DimList, FactList, FilterList, FilterRec, FilterValues: array Of string;
+	FactDimId, FactIdent, Dt1, Dt2: string;
+	FactType: ForeVariantType;
+	IsFactDim, IsInDimensions, IsCalendarInDimensions, IsDateFilter: boolean;
+	DtStart, DtEnd, DtCur: datetime;
+Begin
+	//Debug.WriteLine("sid=" + SourceID + " dimensions=" + Dimensions + " measures=" + Measures + " filters=" + filters + " date_level=" + DateLevel);
+	List := New JsonArrayBuilder.Create;
+	Try
+		// Открытие куба и создание Executor-а
+		CubeInst := MetabaseClass.Active.ItemById(SourceID).Open(Null) As ICubeInstance;
+		DefDes := CubeInst.Destinations.DefaultDestination;
+		Exec := DefDes.CreateExecutor;
+		// Прочитаем списки Id измерений, фактов и фильтров
+		DimList := Dimensions.Split(",", StringSplitOption.NoEmpty Or StringSplitOption.String);
+		FactList := Measures.Split(",", StringSplitOption.NoEmpty Or StringSplitOption.String);
+		FilterList := Filters.Split(";", StringSplitOption.NoEmpty Or StringSplitOption.String);
+		// Создаем структуры для отметки
+		SelectionFact := New DimSelectionSetFactory.Create;
+		DimSS := SelectionFact.CreateDimSelectionSet;
+		DimsM := DefDes.DestinationModel.Dimensions;
+		// id измерения фактов
+		FactDimId := ((DefDes.DestinationModel As IStandardCubeDestination).FactDimension.Dimension As IMetabaseObject).Id;
+		// Цикл по всем измерениям куба - добавляем измерение фактов и другие измерения, указанные в Dimensions (остальные "выкидываются")
+		For i := 0 To DimsM.Count-1 Do
+			Obj := DimsM.Item(i) As IMetabaseObject;
+			// признаки  "невыкидывания" измерений (срабатывание любого должно оставлять измерение в матрице)
+			// 1. Измерение является измерением фактов
+			IsFactDim := Obj.Id = FactDimId;
+			// 2. Измерение есть в перечне Dimensions
+			IsInDimensions := DimList.IndexOf(Obj.Id) >= 0;
+			// 3. Измерение календарное, и в Dimensions есть "date", "month", "year"
+			IsCalendarInDimensions := DimsM.Item(i).IsCalendar And ((DimList.IndexOf("date") >=0) Or (DimList.IndexOf("month") >=0) Or (DimList.IndexOf("year") >=0));
+			// выполняем "выкидывание" либо добавление и стройку измерения
+			If IsFactDim Or IsInDimensions Or IsCalendarInDimensions Then
+				DimSS.Add(Obj.Open(Null) As IDimInstance); // открываем экземпляр измерения и добавляем его в IDimSelectionSet
+			Else
+				Exec.AggregateDimSelection(Obj.Key) := True; // выкидываем
+			End If;
+			// дополнительно обработаем измерения в Filters (они уже "выкнуты", но их нужно открыть для задания отметки)
+			For j := 0 To FilterList.Length-1 Do
+				// пропустим, если измерение уже добавлено
+				If DimSS.FindById(Obj.Id) <> Null Then Continue; End If;
+				// получаем измерение фильтра
+				FilterRec := FilterList[j].Split(":", StringSplitOption.NoEmpty Or StringSplitOption.String);
+				If FilterRec[0] = Obj.Id Then
+					DimSS.Add(Obj.Open(Null) As IDimInstance); // открываем экземпляр измерения и добавляем его в IDimSelectionSet
+				End If;
+				// если текущее измерение - календарное и собираеимся фильтровать дату - добавим его
+				If DimsM.Item(i).IsCalendar And (FilterRec[0] = "date") Then
+					DimSS.Add(Obj.Open(Null) As IDimInstance); // открываем экземпляр измерения и добавляем его в IDimSelectionSet
+				End If;
+			End For;
+		End For;
+		// Установим отметку
+		For Each DimS In DimSS Do
+			// отметка в измерении фактов
+			If DimS.Dimension.Ident = FactDimId Then
+				For i := FactList.GetLowerBound(1) To FactList.GetUpperBound(1) Do
+					If FactList[i].StartsWith("f_") Then
+						FactIdent := FactList[i].SubString(2);
+					Else
+						FactIdent := FactList[i];
+					End If;
+					DimS.SelectElement(DimS.Dimension.Elements.FindById(FactIdent), False);
+				End For;
+			Else
+				If DimS.Dimension.Dimension.IsCalendar Then
+					// обработка отметки для календарного измерения
+					// читаем фильтр date (начальные, конечные даты)
+					For j := 0 To FilterList.Length-1 Do
+						FilterRec := FilterList[j].Split(":", StringSplitOption.NoEmpty Or StringSplitOption.String);
+						If FilterRec[0] = "date" Then
+							FilterValues := FilterRec[1].Split("|", StringSplitOption.NoEmpty Or StringSplitOption.String);
+							If FilterValues.Length = 2 Then
+								Dt1 := FilterValues[0].SubString(8,2) + "." + FilterValues[0].SubString(5,2) + "." + FilterValues[0].SubString(0,4);
+								Dt2 := FilterValues[1].SubString(8,2) + "." + FilterValues[1].SubString(5,2) + "." + FilterValues[1].SubString(0,4);
+								If datetime.TryParse(Dt1, DtStart) And datetime.TryParse(Dt2, DtEnd) Then
+									IsDateFilter := True;
+								End If;
+							End If;
+						End If;
+					End For;
+					//
+					If IsDateFilter Then
+						// если диапазон дат установлен
+						DtCur := DtStart;
+						While DtCur <= DtEnd Do
+							// обработка уровня "год"
+							If (DateLevel = "year") Or (DimList.IndexOf("year") >=0) Then
+								If (DtCur.Day = 1) And (DtCur.Month = 1) Then
+									DimS.SelectElement(DimS.Dimension.Elements.FindById("YEARS:" + DtCur.Year.ToString), False);
+								End If;
+							End If;
+							// обработка уровня "месяц"
+							If (DateLevel = "month") Or (DimList.IndexOf("month") >=0) Then
+								If (DtCur.Day = 1) Then
+									DimS.SelectElement(DimS.Dimension.Elements.FindById("MONTHS:" + DtCur.Month.ToString + "." + DtCur.Year.ToString), False);
+								End If;
+							End If;
+							// обработка уровня "день"
+							If (DateLevel = "day") Or (DateLevel = "") Or (DimList.IndexOf("date") >=0) Then
+								DimS.SelectElement(DimS.Dimension.Elements.FindById("DAYS:" + CultureInfo.Current.FormatDateEx(DtCur, "dd.MM.yyyy")), False);
+							End If;
+							DtCur := datetime.AddDays(DtCur, 1);
+						End While;
+					Else
+						// если диапазон дат не установлен - будет отмечать все элементы по календарным уровням	
+						If (DateLevel = "year") Or (DimList.IndexOf("year") >=0) Then
+							LevelIdx := GetLevelIndexById(DimS.Dimension, "YEARS");
+							If LevelIdx <> -1 Then
+								DimS.SelectLevel(LevelIdx);
+							End If;
+						End If;
+						If (DateLevel = "month") Or (DimList.IndexOf("month") >=0) Then
+							LevelIdx := GetLevelIndexById(DimS.Dimension, "MONTHS");
+							If LevelIdx <> -1 Then
+								DimS.SelectLevel(LevelIdx);
+							End If;
+						End If;
+						If (DateLevel = "day") Or (DimList.IndexOf("date") >=0) Then
+							LevelIdx := GetLevelIndexById(DimS.Dimension, "DAYS");
+							If LevelIdx <> -1 Then
+								DimS.SelectLevel(LevelIdx);
+							End If;
+						End If;
+					End If;
+				Else
+					// обработка отметки для не-календарного измерения
+					DimS.SelectAll;	// отметим все элементы
+					// проверим измерения филльтра
+					For j := 0 To FilterList.Length-1 Do
+						FilterRec := FilterList[j].Split(":", StringSplitOption.NoEmpty Or StringSplitOption.String);
+						// измерение есть в фильтрах, установим на него кастомную отметку
+						If FilterRec[0] = DimS.Dimension.Ident Then
+							DimS.DeselectAll;
+							FilterValues := FilterRec[1].Split("|", StringSplitOption.NoEmpty Or StringSplitOption.String);
+							For i := 0 To FilterValues.Length-1 Do
+								DimS.SelectElement(DimS.Dimension.Elements.FindById(FilterValues[i]), False);
+							End For;
+						End If;
+					End For;
+				End If;
+			End If;
+		End For;
+		// Расчёт матрицы
+		Exec.PrepareExecute(DimSS);
+		Exec.PerformExecute;
+		Matr := Exec.Matrix;
+		// Формирование данных в JSON (обход матрицы)
+		Iterator := Matr.CreateIterator;
+		Coord := Matr.CreateCoord;
+		Iterator.Move(IteratorDirection.First);
+		IteratorMoveFaster(DimSS, Iterator, Coord);
+		// Главный цикл обхода
+		RecN := 0;
+		While Iterator.Valid Do
+			Item := New JsonObjectBuilder.Create;
+			// получение текущей координаты
+			Iterator.PutCurrentPos(Coord);
+			// Цикл по измерениям
+			For i := 0 To Coord.Count-1 Do 
+				// индекс элемента в измерении
+				DimElementIdx := Coord.Item(i);
+				// экземпляр измерения
+				DimInst := Matr.Dimensions.Item(i).Dimension;
+				{If Not DimSS.FindById(DimInst.Ident).IsElementSelected(DimElementIdx) Then
+					Break;
+				End If;}
+				// пропустим фактовое измерение
+				If DimInst.Ident = FactDimId Then
+					//FactElemId := Coord.ElementId(i);
+					FactDimIdx := i;
+					Continue;
+				End If;
+				If Not DimInst.Dimension.IsCalendar Then
+					// добавляем id_измерения:наименование_измерения
+					Item.AddString(DimInst.Ident, DimInst.Elements.Name(DimElementIdx));
+				Else
+					// для календаря - особая обработка
+					BlockType := DimInst.Elements.AttributeValueO(DimElementIdx, DimInst.Attributes.FindById("BLOCK_TYPE"));
+					If BlockType = 5 Then
+						// дни
+						DtCur := DimInst.Elements.AttributeValueO(DimElementIdx, DimInst.Attributes.FindById("START_DATE"));
+						Item.AddString("date", CultureInfo.Current.FormatDateEx(DtCur, "yyyy-MM-dd"));
+					End If;
+					If BlockType = 4 Then
+						// месяцы
+						DtCur := DimInst.Elements.AttributeValueO(DimElementIdx, DimInst.Attributes.FindById("START_DATE"));
+						Item.AddString("month", CultureInfo.Current.FormatDateEx(DtCur, "yyyy-MM"));
+					End If;
+					If BlockType = 1 Then
+						// годы
+						Item.AddInteger("year", DimInst.Elements.AttributeValueO(DimElementIdx, DimInst.Attributes.FindById("YEAR")));
+					End If;
+				End If;
+			End For;
+			// цикл по фактам
+			For i := 0 To DimSS.FindById(FactDimId).SelectedCount-1 Do
+				// Добавляем факт в текущей точке
+				FactType := Iterator.Value.VarType;
+				If FactType = ForeVariantType.String Then
+					Item.AddString("f_" + Coord.ElementId(FactDimIdx), Iterator.Value);
+				End If;
+				If FactType = ForeVariantType.Integer Then
+					Item.AddInteger("f_" + Coord.ElementId(FactDimIdx), Iterator.Value);
+				End If;
+				If (FactType = ForeVariantType.Currency) Or (FactType = ForeVariantType.Decimal) Or (FactType = ForeVariantType.Double) Then
+					Item.AddDouble("f_" + Coord.ElementId(FactDimIdx), Iterator.Value);
+				End If;
+				// 	переходим к следующему факту
+				If i < DimSS.FindById(FactDimId).SelectedCount-1 Then
+					Iterator.Move(IteratorDirection.Next);
+					Iterator.PutCurrentPos(Coord);
+				End If;
+			End For;
+			//
+			List.AddObjectBuilder(Item);
+			RecN := RecN + 1;
+			If RecN > 1000 Then
+				List := New JsonArrayBuilder.Create;
+				Item := New JsonObjectBuilder.Create;
+				Item.AddString("error", "Превышен лимит получаемых записей.");
+				List.AddObjectBuilder(Item);
+				Json := New JsonObjectBuilder.Create;
+				Json.AddArrayBuilder("query_data", List);
+				Doc := New JsonDocument.Create;
+				Doc.RootElement := Json.Build;
+				Return Doc.WriteToString(JsonFormatOptions.UnIndented);
+			End If;
+			// Переход к следующей
+			Iterator.Move(IteratorDirection.Next);
+			IteratorMoveFaster(DimSS, Iterator, Coord);
+		End While;	
+	Except
+		List := New JsonArrayBuilder.Create;
+		Item := New JsonObjectBuilder.Create;
+		Item.AddString("error", "Не удалось получить данные.");
+		List.AddObjectBuilder(Item);
+		Json := New JsonObjectBuilder.Create;
+		Json.AddArrayBuilder("query_data", List);
+		Doc := New JsonDocument.Create;
+		Doc.RootElement := Json.Build;
+		Return Doc.WriteToString(JsonFormatOptions.UnIndented);
+	End Try;
+	// итоговый JSON	
+	Json := New JsonObjectBuilder.Create;
+	Json2 := New JsonObjectBuilder.Create;
+	Json2.AddArrayBuilder("data", List);
+	Json2.AddString("operation", Operation);
+	Json2.AddInteger("records", RecN);
+	Json2.AddString("source", SourceID);
+	Json.AddObjectBuilder("query_data", Json2);
+	Doc := New JsonDocument.Create;
+	Doc.RootElement := Json.Build;
+	Return Doc.WriteToString(JsonFormatOptions.UnIndented);
+End Function MCP_QueryData;
+
+
+// читаем информацию по заданному источнику. Возвращает FALSE если данных нет.
+Public Function MCP_ReadSourceInfo(SourceID: string; Var Name, Type, Description: string; Var Active: boolean): boolean;
+Var
+	Db: IDatabaseInstance;
+	Command : IDalCommand;
+	Params : IDalCommandParams;
+	Cursor: IDalCursor;
+	Fields: IDalCursorFields;
+	SQL: string;
+Begin
+	Try
+		Db := MetabaseClass.Active.ItemById(DB_META).Open(Null) As IDatabaseInstance;
+		SQL := "select name, s_type, description, active from mcp_sources where id = :src_id";
+		Command := Db.Connection.CreateCommand(SQL);
+		Command.Parse;
+		Params := Command.Params;
+		Params.Item(0).Value := SourceID;
+		Cursor := Command.CreateCursor;
+		If not Cursor.Eof Then
+			Fields := Cursor.Fields;
+			Name := Fields.Item(0).Value;
+			Type := Fields.Item(1).Value;
+			Description := Fields.Item(2).Value;
+			Active := Fields.Item(3).Value;
+			Return (True);
+		Else
+			Return(False);	
+		End If;
+		Cursor.Close;
+		Command.Close;
+	Except
+		Return(False);
+	End Try;
+End Function MCP_ReadSourceInfo;
+
+// читаем информацию по заданному факту
+Public Function MCP_ReadFactInfo(SourceID: string; FactID: variant; Var Name, Description, Aggregation, DataType, Format, Unit: string; Var Active: boolean): boolean;
+Var
+	Db: IDatabaseInstance;
+	Command : IDalCommand;
+	Params : IDalCommandParams;
+	Cursor: IDalCursor;
+	Fields: IDalCursorFields;
+	SQL: string;
+Begin
+	Try
+		Db := MetabaseClass.Active.ItemById(DB_META).Open(Null) As IDatabaseInstance;
+		SQL := "select name, description, aggregation, data_type, format, active, unit from mcp_facts where source_id = :src_id and id_s = :fact_id";
+		Command := Db.Connection.CreateCommand(SQL);
+		Command.Parse;
+		Params := Command.Params;
+		Params.Item(0).Value := SourceID;
+		Params.Item(1).Value := FactID As string;
+		Cursor := Command.CreateCursor;
+		If not Cursor.Eof Then
+			Fields := Cursor.Fields;
+			//
+			Name := 		Fields.Item(0).Value;
+			Description := 	Fields.Item(1).Value;
+			Aggregation := 	Fields.Item(2).Value;
+			DataType := 	Fields.Item(3).Value;
+			Format := 		Fields.Item(4).Value;
+			Active := 		Fields.Item(5).Value;
+			Unit := 		Fields.Item(6).Value;
+			//
+			Return (True);
+		Else
+			Return(False);	
+		End If;
+		Cursor.Close;
+		Command.Close;
+	Except
+		Return(False);
+	End Try;
+End Function MCP_ReadFactInfo;
+
+
+// пишем информацию по заданному источнику
+Public Function MCP_WriteSourceInfo(SourceID, Name, Type, Description: string; Active: boolean): boolean;
+Var
+	Db: IDatabaseInstance;
+	Command : IDalCommand;
+	Params : IDalCommandParams;
+	SQL: string;
+Begin
+	Try
+		Db := MetabaseClass.Active.ItemById(DB_META).Open(Null) As IDatabaseInstance;
+		// удаление
+		SQL := "delete from mcp_sources where id = :src_id";
+		Command := Db.Connection.CreateCommand(SQL);
+		Command.Parse;
+		Params := Command.Params;
+		Params.Item(0).Value := SourceID;
+		Command.Execute;
+		Command.Close;
+		// вставка
+		SQL := "insert into mcp_sources (id, name, s_type, description, active) values (:src_id, :name, :s_type, :desc, :active)";
+		Command := Db.Connection.CreateCommand(SQL);
+		Command.Parse;
+		Params := Command.Params;
+		Params.Item(0).Value := SourceID;
+		Params.Item(1).Value := Name;
+		Params.Item(2).Value := Type;
+		Params.Item(3).Value := Description;
+		If Active Then
+			Params.Item(4).Value := 1;
+		Else			
+			Params.Item(4).Value := 0;
+		End If;
+		Command.Execute;
+		Command.Close;
+		Return(True);
+	Except
+		Return(False);
+	End Try;
+End Function MCP_WriteSourceInfo;
+
+// удаляем информацию по заданному источнику из MCP-метаданных
+Public Function MCP_DeleteSource(SourceID: string): boolean;
+Var
+	Db: IDatabaseInstance;
+	Command : IDalCommand;
+	Params : IDalCommandParams;
+	SQL: string;
+Begin
+	Try
+		Db := MetabaseClass.Active.ItemById(DB_META).Open(Null) As IDatabaseInstance;
+		// удаление
+		SQL := "delete from mcp_sources where id = :src_id";
+		Command := Db.Connection.CreateCommand(SQL);
+		Command.Parse;
+		Params := Command.Params;
+		Params.Item(0).Value := SourceID;
+		Command.Execute;
+		Command.Close;
+		Return(True);
+	Except
+		Return(False);
+	End Try;
+End Function MCP_DeleteSource;
+
+
+// пишем MCP-метаданные по заданному факту
+Public Function MCP_WriteFactInfo(SourceID: string; FactID: variant; Name, Description, Aggregation, DataType, Format, Unit: string; Active: boolean): boolean;
+Var
+	Db: IDatabaseInstance;
+	Command : IDalCommand;
+	Params : IDalCommandParams;
+	SQL: string;
+Begin
+	Try
+		Db := MetabaseClass.Active.ItemById(DB_META).Open(Null) As IDatabaseInstance;
+		// удаление
+		SQL := "delete from mcp_facts where source_id = :src_id and id_s = :fact_id";
+		Command := Db.Connection.CreateCommand(SQL);
+		Command.Parse;
+		Params := Command.Params;
+		Params.Item(0).Value := SourceID;
+		Params.Item(1).Value := FactID As String;
+		Command.Execute;
+		Command.Close;
+		// вставка
+		SQL := "insert into mcp_facts (source_id, id_s, id_n, name, description, aggregation, data_type, format, active, unit) values (:src_id, :fact_id_s, :fact_id_n, :name, :desc, :aggr, :datatype, :fmt, :active, :unit)";
+		Command := Db.Connection.CreateCommand(SQL);
+		Command.Parse;
+		Params := Command.Params;
+		Params.Item(0).Value := SourceID;
+		Params.Item(1).Value := FactID As string;
+		If FactID.VarType = ForeVariantType.Integer Then
+			Params.Item(2).Value := FactID;
+		End If;
+		Params.Item(3).Value := Name;
+		Params.Item(4).Value := Description;
+		Params.Item(5).Value := Aggregation;
+		Params.Item(6).Value := DataType;
+		Params.Item(7).Value := Format;
+		If Active Then
+			Params.Item(8).Value := 1;
+		Else			
+			Params.Item(8).Value := 0;
+		End If;
+		Params.Item(9).Value := Unit;
+		Command.Execute;
+		Command.Close;
+		Return(True);
+	Except
+		Return(False);
+	End Try;
+End Function MCP_WriteFactInfo;
+
+// удаляем факт из MCP-метаданные 
+Public Function MCP_DeleteFact(SourceID: string; FactID: variant; DeleteAll: boolean): boolean;
+Var
+	Db: IDatabaseInstance;
+	Command : IDalCommand;
+	Params : IDalCommandParams;
+	SQL: string;
+Begin
+	Try
+		Db := MetabaseClass.Active.ItemById(DB_META).Open(Null) As IDatabaseInstance;
+		// удаление
+		If DeleteAll Then
+			SQL := "delete from mcp_facts where source_id = :src_id";
+		Else	
+			SQL := "delete from mcp_facts where source_id = :src_id and id_s = :fact_id";
+		End If;
+		Command := Db.Connection.CreateCommand(SQL);
+		Command.Parse;
+		Params := Command.Params;
+		Params.Item(0).Value := SourceID;
+		If Not DeleteAll Then
+			Params.Item(1).Value := FactID As String;
+		End If;
+		Command.Execute;
+		Command.Close;
+		Return(True);
+	Except
+		Return(False);
+	End Try;
+End Function MCP_DeleteFact;
+
+// пишем MCP-метаданные по заданному факту
+Public Function MCP_WriteDimInfo(SourceID, DimID, Name, Description, DimType: string; Active: boolean): boolean;
+Var
+	Db: IDatabaseInstance;
+	Command : IDalCommand;
+	Params : IDalCommandParams;
+	SQL: string;
+Begin
+	Try
+		Db := MetabaseClass.Active.ItemById(DB_META).Open(Null) As IDatabaseInstance;
+		// удаление
+		SQL := "delete from mcp_dimensions where source_id = :src_id and id = :id";
+		Command := Db.Connection.CreateCommand(SQL);
+		Command.Parse;
+		Params := Command.Params;
+		Params.Item(0).Value := SourceID;
+		Params.Item(1).Value := DimID;
+		Command.Execute;
+		Command.Close;
+		// вставка
+		SQL := "insert into mcp_dimensions (source_id, id, name, description,  dim_type, active) values (:src_id, :id, :name, :desc, :dimtype, :active)";
+		Command := Db.Connection.CreateCommand(SQL);
+		Command.Parse;
+		Params := Command.Params;
+		Params.Item(0).Value := SourceID;
+		Params.Item(1).Value := DimID;
+		Params.Item(2).Value := Name;
+		Params.Item(3).Value := Description;
+		Params.Item(4).Value := DimType;
+		If Active Then
+			Params.Item(5).Value := 1;
+		Else			
+			Params.Item(5).Value := 0;
+		End If;
+		Command.Execute;
+		Command.Close;
+		Return(True);
+	Except
+		Return(False);
+	End Try;
+End Function MCP_WriteDimInfo;
+
+// удаляем измерение из списка для MCP-метаданных
+Public Function MCP_DeleteDim(SourceID, DimID: string; DeleteAll: boolean): boolean;
+Var
+	Db: IDatabaseInstance;
+	Command : IDalCommand;
+	Params : IDalCommandParams;
+	SQL: string;
+Begin
+	Try
+		Db := MetabaseClass.Active.ItemById(DB_META).Open(Null) As IDatabaseInstance;
+		// удаление
+		If DeleteAll Then
+			SQL := "delete from mcp_dimensions where source_id = :src_id";
+		else	
+			SQL := "delete from mcp_dimensions where source_id = :src_id and id = :id";
+		End If;
+		Command := Db.Connection.CreateCommand(SQL);
+		Command.Parse;
+		Params := Command.Params;
+		Params.Item(0).Value := SourceID;
+		If Not DeleteAll Then
+			Params.Item(1).Value := DimID;
+		End If;
+		Command.Execute;
+		Command.Close;
+		Return(True);
+	Except
+		Return(False);
+	End Try;
+End Function MCP_DeleteDim;
+
+
+// читаем информацию по заданному измерению
+Public Function MCP_ReadDimInfo(SourceID, DimID: string; Var Name, Description, DimType: string; Var Active: boolean): boolean;
+Var
+	Db: IDatabaseInstance;
+	Command : IDalCommand;
+	Params : IDalCommandParams;
+	Cursor: IDalCursor;
+	Fields: IDalCursorFields;
+	SQL: string;
+Begin
+	Try
+		Db := MetabaseClass.Active.ItemById(DB_META).Open(Null) As IDatabaseInstance;
+		SQL := "select name, description, dim_type, active from mcp_dimensions where source_id = :src_id and id = :dim_id";
+		Command := Db.Connection.CreateCommand(SQL);
+		Command.Parse;
+		Params := Command.Params;
+		Params.Item(0).Value := SourceID;
+		Params.Item(1).Value := DimID;
+		Cursor := Command.CreateCursor;
+		If not Cursor.Eof Then
+			Fields := Cursor.Fields;
+			//
+			Name := 		Fields.Item(0).Value;
+			Description := 	Fields.Item(1).Value;
+			DimType := 		Fields.Item(2).Value;
+			Active := 		Fields.Item(3).Value;
+			//
+			Return (True);
+		Else
+			Return(False);	
+		End If;
+		Cursor.Close;
+		Command.Close;
+	Except
+		Return(False);
+	End Try;
+End Function MCP_ReadDimInfo;
+
+
+// ф-я заполняет массив -  список фактов куба (ключ(ident), наименование).. берется версия (Destination) куба по умолчанию 
+// возвращает признак успешности операции (TRUE/FALSE)
+Public Function GetCubeFacts(CubeID: string; Var FactsList: array): boolean;
+Var
+	Cube: IStandardCube;
+	CubeDest: IStandardCubeDestination;
+	FactDimInst: IDimInstance;
+	i: integer;
+Begin
+	Try
+		// куб
+		Cube := MetabaseClass.Active.ItemById(CubeID).Edit As IStandardCube;
+		//
+		{For Each CubeDest In Cube.Destinations Do
+			If CubeDest.IsDefault Then
+				Break;
+			End If;
+		End For;}
+		For i := 0 To Cube.Destinations.Count-1 Do
+			CubeDest := Cube.Destinations.Item(i);
+			//Debug.WriteLine(CubeDest.Id + " " + CubeDest.Key.ToString + " " + CubeDest.IsDefault.ToString); 
+			If CubeDest.IsDefault Then
+				Break;
+			End If;
+		End For;
+		// обрабатываем внутреннее измерение фактов
+		FactDimInst := CubeDest.FactDimension.OpenDimension;
+		If FactDimInst <> Null Then
+			FactsList := New Variant[FactDimInst.Elements.Count, 2];
+			// цикл по элементам
+			For i := 0 To FactDimInst.Elements.Count-1 Do
+				FactsList[i, 0] := FactDimInst.Elements.Id(i);
+				FactsList[i, 1] := FactDimInst.Elements.Name(i);
+			End For;
+		End If;
+		Return(True);
+	Except On E: Exception Do
+		Debug.WriteLine(E.Message);
+		Return(False);
+	End Try;
+End Function GetCubeFacts;
+
+// ф-я заполняет массив -  список измерений куба (кроме измерения фактов). Формирует массив  (id, наименование, признак_календарного). Берет Destination по умолчанию
+// возвращает признак успешности операции (TRUE/FALSE)
+Public Function GetCubeDimensions(CubeID: string; Var DimList: array): boolean;
+Var
+	Cube: IStandardCube;
+	CubeDest: IStandardCubeDestination;
+	i, idx: integer;
+Begin
+	Try
+		// куб
+		Cube := MetabaseClass.Active.ItemById(CubeID).Edit As IStandardCube;
+		//
+		For i := 0 To Cube.Destinations.Count-1 Do
+			CubeDest := Cube.Destinations.Item(i);
+			If CubeDest.IsDefault Then
+				Break;
+			End If;
+		End For;
+		//
+		DimList := New Variant[CubeDest.Dimensions.Count-1, 3]; // на одно измерение меньше за счет фактового
+		idx := 0;
+		For i := 0 To CubeDest.Dimensions.Count-1 Do
+			// пропустим фактовые измерения
+			If CubeDest.Dimensions.Item(i).FactDimension Then
+				Continue;
+			End If;
+			//
+			DimList[idx, 0] := (CubeDest.Dimensions.Item(i).Dimension As IMetabaseObject).Id;
+			DimList[idx, 1] := (CubeDest.Dimensions.Item(i).Dimension As IMetabaseObject).Name;
+			DimList[idx, 2] := CubeDest.Dimensions.Item(i).Dimension.IsCalendar;
+			idx := idx + 1;
+		End For;
+		Return(True);
+	Except On E: Exception Do
+		Debug.WriteLine(E.Message);
+		Return(False);
+	End Try;
+End Function GetCubeDimensions;
+
+
+// ТЕСТЫ
+
+Sub Main;
+Begin
+	//  1. Общая выручка за всё время
+	//Debug.WriteLine(MCP_QueryData("OBJ80708_MCP", "", "f_0,f_1", "", "sum", ""));
+	//  2. Общая выручка за 1 декаду января 2020 - filters = {"date": [	"2020-01-01","2020-01-10"  ]} 56 446 619 794 ₽.
+	//Debug.WriteLine(MCP_QueryData("OBJ80708_MCP", "", "f_0,f_1", "date:2020-01-01|2020-01-10", "sum", "day"));
+	//  3. Выручка по дням за 1 декаду февраля
+	//Debug.WriteLine(MCP_QueryData("OBJ80708_MCP", "date", "f_1", "date:2020-02-01|2020-02-10", "sum", "day"));
+	//  3a. Выручка по дням за 1 декаду февраля по Пермскому краю
+	//Debug.WriteLine(MCP_QueryData("OBJ80708_MCP", "date", "f_1", "date:2020-02-01|2020-02-10;DIM_TERR:Пермский край", "sum", "day"));
+	//  4. Выручка по месяцам за 1 квартал 2020
+	//Debug.WriteLine(MCP_QueryData("OBJ80708_MCP", "month", "f_0,f_1", "date:2020-01-01|2020-03-31", "sum", "month"));
+	//  4a. Выручка за январь 2020: 191 400 886 304р
+	//Debug.WriteLine(MCP_QueryData("OBJ80708_MCP", "month", "f_1", "date:2020-01-01|2020-01-31", "sum", "month"));
+	// 5. Выручка по месяцам за 1 квартал 2020 по группам товаров "Техника для кухни" и "Техника для дома"
+	//Debug.WriteLine(MCP_QueryData("OBJ80708_MCP", "month,DIM_GROUP", "f_1", "date:2020-01-01|2020-03-31;DIM_GROUP:Техника для кухни|Техника для дома", "sum", "month"));
+	//Debug.WriteLine(MCP_QueryData("OBJ80708_MCP", "year", "f_0,f_1", "", "sum", ""));
+	// 6. В разрезе регионов
+	//Debug.WriteLine(MCP_QueryData("OBJ80708_MCP", "DIM_TERR", "f_1", "", "sum", ""));
+End Sub Main;
+
